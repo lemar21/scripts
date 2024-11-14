@@ -1,0 +1,308 @@
+# Jira Integration Workflow for Change Management
+name: Jira Integration Workflow for Change Management
+
+on:
+  pull_request:
+    types: [opened, edited]
+
+env:
+  JIRA_BASE_URL:       ${{ vars.JIRA_BASE_URL }}
+  JIRA_BASE_ISSUE_URL: ${{ vars.JIRA_BASE_ISSUE_URL }}
+  JIRA_API_TOKEN:      ${{ secrets.JIRA_API_TOKEN }}
+  JIRA_USER_EMAIL:     ${{ vars.JIRA_USER_EMAIL }}
+  GITHUB_TOKEN:        ${{ secrets.GITHUB_TOKEN }}
+  PR_URL:              ${{ github.event.pull_request.html_url }}
+  GITHUB_REPOSITORY:   ${{ github.repository }}
+  COMMIT_MESSAGE:      ${{ github.event.pull_request.title }}
+  SHORT_DESCRIPTION:   ${{ github.event.pull_request.title }}V
+  COMMIT_EMAIL:        ${{ github.event.pull_request.user.email }}
+  PULL_REQUEST_NUMBER: ${{ github.event.pull_request.number }}
+
+jobs:
+  jira-integration:
+    runs-on: ubuntu-latest
+    steps:
+
+    - name: Checkout repo
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ github.event.pull_request.head.ref }}
+        repository: ${{ github.event.pull_request.head.repo.full_name }}
+
+    - name: Check if the required repo-metadata.xml file exists
+      id: check_file
+      run: |
+          if [ ! -f .github/repo-metadata.xml ]; then
+            echo "Can't parse .github/repo-metadata.xml file"
+            exit 1
+          fi
+
+    - name: Extract environment variable from repo-metadata.xml file
+      id: extract_environment
+      uses: mavrosxristoforos/get-xml-info@2.0
+      with:
+        xml-file: '.github/repo-metadata.xml'
+        xpath: '//repo-metadata/environment'
+  
+    - name: Extract jiraIssueKey variable from repo-metadata.xml file
+      id: extract_jira
+      uses: mavrosxristoforos/get-xml-info@2.0
+      with:
+        xml-file: '.github/repo-metadata.xml'
+        xpath: '//repo-metadata/jiraIssueKey'
+
+    - name: Check if mandatory jiraIssueKey is not empty
+      id: check_jira
+      run: |
+        if [ -z "${{ steps.extract_jira.outputs.info }}" ]; then
+          echo "JIRA Issue Key is empty"
+          exit 1
+        fi
+
+    - name: Skip the rest for non-production repositories 
+      id: handle_env
+      run: |
+        environment=$(echo "${{ steps.extract_environment.outputs.info }}" | tr '[:upper:]' '[:lower:]')
+        if [ "$environment" = "experimental" ]; then
+          echo "Experimental repo. Skipping change management request"
+          exit 0
+        elif [ "$environment" = "production" ]; then
+          echo "Production repo. Generating change management request"
+        else
+          echo "Unknown environment: $environment"
+          exit 1
+        fi
+
+    - name: Retrieve PR body
+      run: |
+        RESPONSE=$(curl -s -L \
+          -H "Accept: application/vnd.github+json" \
+          -H "Authorization: Bearer $GITHUB_TOKEN" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          https://api.github.com/repos/$GITHUB_REPOSITORY/pulls/$PULL_REQUEST_NUMBER \
+          | jq '.body'
+        )
+        RESPONSE=$(echo "${RESPONSE}" | tr -d '\r')
+        echo "***************************************************************"
+        echo "${RESPONSE}" 
+        echo "***************************************************************"
+        echo "PR_BODY=$RESPONSE" >> ${GITHUB_ENV}
+
+    - name: Extract Jira Issue Number form the PR
+      run: |
+        PR_BODY=$(echo -e ${PR_BODY})
+      
+        # Get Jira Issue from **Jira ticket** string on the PR template
+        JIRA_KEY=$(echo "${PR_BODY}" | grep "\*\*Jira ticket\*\*" | sed -E 's/.*[ #/]+([^ ]+) *$/\1/' | sed 's/[^[:print:]]//g' | awk '{print toupper($0)}')
+
+        # Extract Jira Base Key from the JIRA_KEY
+        if [[ "$JIRA_KEY" =~ [0-9] ]]; then
+          # Remove numbers and keep only letters
+          JIRA_BASE_KEY=$(echo "$JIRA_KEY" | tr -cd '[:alpha:]')
+        else
+          # No numbers, take the Jira Base Kay from Repo metadata file
+          JIRA_BASE_KEY=${{ steps.extract_jira.outputs.info }}
+        fi
+
+        # Check if new Jira Issue has been created and listed in the body of the
+        # PR, but Jira Issue in the PR still says NEW-JIRA-ISSUE
+        # Overwriting the JIRA_KEY with the Jira Issue
+        # from the RP comment to avoid creating multiple Jira tickets.
+        if [[ "$JIRA_KEY" = "NEW-JIRA-ISSUE" ]]; then
+          echo "Jira Issue is NEW-JIRA-ISSUE. Checking if Jira Issue number already exists in the PR body"
+          RESPONSE=$(curl -s -L \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${PULL_REQUEST_NUMBER}/comments \
+            | jq '.[].body' || true \
+            | grep "Jira issue created successfully: "
+          )
+          
+          # Check if RESPONSE is not empty, extract Jira Issue number
+          if [ -n "$RESPONSE" ]; then
+            JIRA_KEY=$(echo ${RESPONSE} | head -n 1 | sed 's:.*/::' | tr -d '[:space:]"')
+            echo "Found existing Jira ticket in the RP body. Will use it instead of creating a new Issue"
+          else
+            echo "There is no Jira Issue number in the PR body. Proceeding with NEW-JIRA-ISSUE"
+          fi
+        fi
+
+        echo "JIRA_KEY: ${JIRA_KEY}" 
+        echo "JIRA_BASE_KEY: ${JIRA_BASE_KEY}"         
+        echo "JIRA_KEY=$JIRA_KEY" >> ${GITHUB_ENV}
+        echo "JIRA_BASE_KEY=$JIRA_BASE_KEY" >> ${GITHUB_ENV}
+
+    - name: Check if Jira Issue field in the Change Management Template is updated
+      id: chaeck_cm_update
+      run: |  
+        if [[ "$JIRA_KEY" = "JIRA-ISSUE" ]]; then
+          echo "You need to change #JIRA-ISSUE in the Change Management template to the existing"
+          echo "Jira Issue or change #JIRA-ISSUE to #NEW-JIRA-ISSUE to auto create a new Jira Issue"
+          exit 1
+        fi
+
+    - name: Check if Jira Issue exists
+      id: chaeck_jira
+      run: |  
+        if [[ "$JIRA_KEY" != *"JIRA-ISSUE" ]]; then
+          echo "Check if Jira issue exists"
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" --request GET \
+            --url "${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_KEY}" \
+            --user "${JIRA_USER_EMAIL}:${JIRA_API_TOKEN}" \
+            --header 'Accept: application/json' \
+            --header 'Content-Type: application/json'
+          )
+
+          if [ "$RESPONSE" -ne 200 ]; then
+            echo "Error: Entered Jira issue ${JIRA_KEY} does not exist. Responce code: $RESPONSE"
+            exit 1
+          else
+            echo "Success Jira issue ${JIRA_KEY} exists. Proceeding"
+          fi
+
+        fi
+
+    - name: Jira
+      id: jira_issue
+      run: | 
+        DESCRIPTION=$(echo -e ${PR_BODY} | tr -d '\r')
+        DESCRIPTION=$(echo -e "Change Management Request\nCommit message: ${COMMIT_MESSAGE}\nActor: ${GITHUB_ACTOR}\nWorkspace: ${GITHUB_WORKSPACE}\nRepository: ${GITHUB_REPOSITORY}\nPR URL: ${PR_URL}\nCommit email: ${COMMIT_EMAIL}\n\n${DESCRIPTION}")
+        DESCRIPTION=$(echo "$DESCRIPTION" | awk '{gsub(/"/, "\\\""); gsub(/\n/, "\\n")}1' ORS='\\n')
+        echo "DESCRIPTION<<EOF" >> $GITHUB_ENV
+        echo "$DESCRIPTION" >> $GITHUB_ENV
+        echo "EOF" >> $GITHUB_ENV
+
+        if [[ "$JIRA_KEY" == "NEW-JIRA-ISSUE" ]]; then
+
+          # Create a new Jira Issue
+          echo "Create a new Jira Issue"
+
+        JSON_PAYLOAD=$(cat <<EOF
+        {
+          "fields": {
+            "project": {
+              "key": "${JIRA_BASE_KEY}"
+            },
+            "summary": "Change Request: ${COMMIT_MESSAGE} for ${GITHUB_REPOSITORY} repository",
+            "description": {
+              "type": "doc",
+              "version": 1,
+              "content": [
+                {
+                  "type": "paragraph",
+                  "content": [
+                    {
+                      "text": "${DESCRIPTION}",
+                      "type": "text"
+                    }
+                  ]
+                }
+              ]
+            },
+            "issuetype": {
+              "name": "Task"
+            },
+            "labels": ["change-management"]
+          }
+        }
+        EOF
+        )
+
+          RESPONSE=$(curl -s --request POST \
+            --url "${JIRA_BASE_URL}/rest/api/3/issue" \
+            --user "${JIRA_USER_EMAIL}:${JIRA_API_TOKEN}" \
+            --header 'Accept: application/json' \
+            --header 'Content-Type: application/json' \
+            --data "$JSON_PAYLOAD")
+
+          if [[ $RESPONSE == *"key"* ]]; then
+            echo "Jira issue created successfully: $RESPONSE"
+            issue_key=$(echo ${RESPONSE} | jq -r '.key')
+            echo "EXIT_MESSAGE=$(echo Jira issue created successfully: ${JIRA_BASE_ISSUE_URL}${JIRA_BASE_KEY}/issues/${issue_key})" >> ${GITHUB_ENV}
+            echo "EXIT_STATUS=$(echo 0)" >> ${GITHUB_ENV}
+          else
+            echo "Failed to create Jira issue"
+            echo "EXIT_MESSAGE=$(echo Error: Failed to create Jira issue)" >> ${GITHUB_ENV}
+            echo "EXIT_STATUS=$(echo 1)" >> ${GITHUB_ENV}
+          fi
+
+        else
+
+          # Update existing Jira Issue
+          echo "Updating existing Jira Issue"
+
+        JSON_PAYLOAD=$(cat <<EOF
+        {
+          "update": {
+            "labels": [
+              {
+                "add": "change-management"
+              }
+            ],
+            "comment": [
+              {
+                "add": {
+                  "body": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [
+                      {
+                        "type": "paragraph",
+                        "content": [
+                          {
+                            "type": "text",
+                            "text": "$DESCRIPTION"
+                          }
+                        ]
+                      }
+                    ]
+                  }
+                }
+              }
+            ]
+          }
+        }
+        EOF
+        )
+
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" --request PUT \
+            --url "${JIRA_BASE_URL}/rest/api/3/issue/${JIRA_KEY}" \
+            --user "${JIRA_USER_EMAIL}:${JIRA_API_TOKEN}" \
+            --header 'Accept: application/json' \
+            --header 'Content-Type: application/json' \
+            --data "$JSON_PAYLOAD")
+
+          # Check if the update was successful
+          if [ "$RESPONSE" -eq 204 ]; then
+            echo "JIRA issue updated successfully"
+            echo "EXIT_MESSAGE=$(echo Jira issue updated successfully: ${JIRA_BASE_ISSUE_URL}${JIRA_BASE_KEY}/issues/${JIRA_KEY})" >> ${GITHUB_ENV}
+            echo "EXIT_STATUS=$(echo 0)" >> ${GITHUB_ENV}             
+          else
+            echo "Error: Failed to update the Jira issue. Status code: $RESPONSE"
+            echo "EXIT_MESSAGE=$(echo Error: Failed to update the Jira issue)" >> ${GITHUB_ENV}
+            echo "EXIT_STATUS=$(echo 1)" >> ${GITHUB_ENV}
+          fi
+
+        fi
+
+    - name: Update PR with the Jira issue information
+      id: pr-update
+      uses: actions/github-script@v6
+      with:
+        github-token: ${{ secrets.GITHUB_TOKEN }}
+        script: |
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: "${{ env.EXIT_MESSAGE }}"
+          });   
+
+    - name: Exit status
+      run: |
+        if [[ "${{ env.EXIT_STATUS }}" == "0" ]]; then
+          exit 0
+        else 
+          exit 1
+        fi
